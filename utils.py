@@ -46,8 +46,7 @@ def get_models(config_path: str, ckpt_path: str, device: str):
 
     return model_orig, sampler_orig, model, sampler
 
-def load_flux_models(torch_dtype=torch.bfloat16, device='cuda:0', lora_rank=16):
-    basemodel_id="black-forest-labs/FLUX.1-dev"
+def load_flux_models(basemodel_id="black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16, device='cuda:0', lora_rank=16):
     
     esd_transformer = FluxTransformer2DModel.from_pretrained(basemodel_id, subfolder="transformer", torch_dtype=torch_dtype).to(device)
     pipe_orig = FluxPipeline.from_pretrained(basemodel_id,
@@ -70,12 +69,11 @@ def load_flux_models(torch_dtype=torch.bfloat16, device='cuda:0', lora_rank=16):
     )
     pipe.transformer = get_peft_model(pipe.transformer, lora_config)
     pipe.transformer.train()
-    sampler = DDIMSampler(pipe)
 
     pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taef1", torch_dtype=torch_dtype).to(device)
     pipe_orig.vae = AutoencoderTiny.from_pretrained("madebyollin/taef1", torch_dtype=torch_dtype).to(device)
 
-    return pipe, pipe_orig, sampler
+    return pipe, pipe_orig
 
 def print_trainable_parameters(model, max_params: int = 10):
     """Print the first few trainable parameters"""
