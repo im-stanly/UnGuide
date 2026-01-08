@@ -7,13 +7,20 @@ from functools import partial
 import numpy as np
 import torch
 
-from utils import print_trainable_parameters, set_seed, get_models
+from utils import load_flux_models, print_trainable_parameters, set_seed
 from tqdm import tqdm
 
 
 from ldm.util import instantiate_from_config
 from sampling import sample_model
 from lora import LoRALinear, inject_lora_nsfw, inject_lora
+
+import sys
+from diffusers import FluxPipeline
+
+sys.path.append('.')
+from utils.flux_utils import esd_flux_call
+FluxPipeline.__call__ = esd_flux_call
 
 def parse_args():
     """Parse command line arguments"""
@@ -173,36 +180,39 @@ def main():
 
     # Initialize models
     print("Loading models...")
-    model_orig, sampler_orig, model, sampler = get_models(
-        args.config_path, args.ckpt_path, args.device
-    )
+    torch_dtype = torch.bfloat16
+    model_orig, model, sampler = load_flux_models(torch_dtype=torch_dtype, device =args.device)
+
+    model.set_progress_bar_config(disable=True)
 
     # Create LoRA factory function
     lora_factory = partial(LoRALinear, rank=args.lora_rank, alpha=args.lora_alpha)
     # Freeze original model parameters
-    for param in model.model.diffusion_model.parameters():
-        param.requires_grad = False
+    for pipeline in [model, model_orig]:
+        pipeline.vae.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
 
     # Inject LoRA layers
-    print("Injecting LoRA layers...")
-    if args.prompts_json.endswith("nsfw.json"):
-        inject_lora_nsfw(model.model.diffusion_model, lora_factory=lora_factory)
-    else:
-        inject_lora(model.model.diffusion_model, args.target_modules, lora_factory)
+    # print("Injecting LoRA layers...") # I think it is already done in load_flux_models
+    # if args.prompts_json.endswith("nsfw.json"):
+    #     inject_lora_nsfw(model.model.diffusion_model, lora_factory=lora_factory)
+    # else:
+    #     inject_lora(model.model.diffusion_model, args.target_modules, lora_factory)
 
     # Get trainable parameters (only LoRA layers)
     lora_layers = list(
-        filter(lambda p: p.requires_grad, model.model.diffusion_model.parameters())
+        filter(lambda p: p.requires_grad, model.transformer.parameters())
     )
     print(f"Total trainable parameters: {len(lora_layers)}")
     print_trainable_parameters(model)
 
     # Set model to training mode
-    model.train()
+    # model.train() # It is already set in load_flux_models
 
     # Disable checkpointing for faster training
     model.use_checkpoint = False
-    model.model.diffusion_model.use_checkpoint = False
+    model.transformer.use_checkpoint = False
 
     # Initialize training components
     optimizer = torch.optim.Adam(lora_layers, lr=args.lr)
@@ -233,13 +243,22 @@ def main():
         t_enc_ddpm = torch.randint(og_num, og_num_lim, (1,), device=args.device)
 
         # Generate random starting noise
-        start_code = torch.randn((1, 4, args.image_size // 8, args.image_size // 8)).to(
-            args.device
-        )
+        # start_code = torch.randn((1, 4, args.image_size // 8, args.image_size // 8)).to(
+        #     args.device
+        # )
+        height=width= args.image_size # I'm not sure about this
+        model_input = model.vae.encode(torch.randn((1, 4, height, width)).to(torch_dtype).to(model.vae.device)).latents.cpu() # I'm not sure if it should be here
+        latent_image_ids = FluxPipeline._prepare_latent_image_ids(model_input.shape[0],
+                                                                model_input.shape[2]// 2,
+                                                                model_input.shape[3]// 2,
+                                                                args.device,
+                                                                torch_dtype,
+                                                                )
 
+        model.transformer.eval()
         with torch.no_grad():
             # Sample latent representation
-            z = quick_sampler(emb_p, args.start_guidance, start_code, int(t_enc))
+            z = quick_sampler(emb_p, args.start_guidance, model_input, int(t_enc))
             
             # Get predictions from original model
             e_0 = model_orig.apply_model(z, t_enc_ddpm, emb_0)  # Reference
@@ -269,7 +288,7 @@ def main():
     
     print(f"Saving trained model to {args.output_dir}/{dir_name}/models")
     lora_state_dict = {}
-    for name, param in model.model.diffusion_model.named_parameters():
+    for name, param in model.transformer.named_parameters():
         if param.requires_grad:
             lora_state_dict[name] = param.cpu().detach().clone()
     lora_path = os.path.join(args.output_dir, dir_name, "models", "lora.pth")

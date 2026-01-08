@@ -1,8 +1,17 @@
+import sys
 from ldm.util import instantiate_from_config
 from omegaconf import OmegaConf
 import torch
 import numpy as np
 from ldm.models.diffusion.ddimcopy import DDIMSampler
+from diffusers import FluxPipeline, AutoencoderTiny
+from diffusers.models import FluxTransformer2DModel
+from diffusers.utils import make_image_grid
+from peft import LoraConfig, get_peft_model
+
+sys.path.append('.')
+from utils.flux_utils import esd_flux_call
+FluxPipeline.__call__ = esd_flux_call
 
 def set_seed(seed: int):
     torch.random.manual_seed(seed)
@@ -37,6 +46,36 @@ def get_models(config_path: str, ckpt_path: str, device: str):
 
     return model_orig, sampler_orig, model, sampler
 
+def load_flux_models(torch_dtype=torch.bfloat16, device='cuda:0', lora_rank=16):
+    basemodel_id="black-forest-labs/FLUX.1-dev"
+    
+    esd_transformer = FluxTransformer2DModel.from_pretrained(basemodel_id, subfolder="transformer", torch_dtype=torch_dtype).to(device)
+    pipe_orig = FluxPipeline.from_pretrained(basemodel_id,
+                                        transformer=esd_transformer,
+                                        vae=None,
+                                        torch_dtype=torch_dtype, 
+                                        use_safetensors=True).to(device)
+
+    pipe = FluxPipeline.from_pretrained(basemodel_id,
+                                             transformer=esd_transformer,
+                                             vae=None,
+                                             torch_dtype=torch_dtype,
+                                             use_safetensors=True).to(device)
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        bias="none",
+    )
+    pipe.transformer = get_peft_model(pipe.transformer, lora_config)
+    pipe.transformer.train()
+    sampler = DDIMSampler(pipe)
+
+    pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taef1", torch_dtype=torch_dtype).to(device)
+    pipe_orig.vae = AutoencoderTiny.from_pretrained("madebyollin/taef1", torch_dtype=torch_dtype).to(device)
+
+    return pipe, pipe_orig, sampler
 
 def print_trainable_parameters(model, max_params: int = 10):
     """Print the first few trainable parameters"""
